@@ -1,0 +1,216 @@
+---
+title: "Data 607_Project 1_Chess ELO"
+author: "Mustafa Telab"
+date: "9/12/2020"
+output:
+  html_document:
+    toc: true
+    toc_float:
+      collapsed: true
+      smooth_scroll: false
+---
+# Introduction
+In this analysis we will be taking a close look at a cross table, or scoring sheet, for a particular chess tournament.  In particular, we will be highlighting a particular competitor scoring system called "ELO."  ELO is a method that allocated points to the participants base on their relative rating.  Using the ELO scores from the start of the tournament, we can calculate the expected outcome of the tournament and make comparisons to the actual result.  Ultimately, we want to give credit to the chess players who beat the odds, and we want to examine how effective the ELO rating is for predictions.
+
+1.  Pull data down from repository.
+
+2.  Extract the variables using regular expressions to build our data frame.
+
+3.  Transform the data frame to facilitate competitor comparisons.
+
+4.  Add calculated fields related to ELO rating.
+
+5.  Give credit to the tournaments over-performers.
+
+6.  Examine the accuracy of ELO predictions.
+
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+# Build Data frame
+We will start with a raw text file stored on a git repository.
+
+```{r}
+library(RCurl)
+library(stringr)
+library(ggplot2)
+library(tidyverse)
+
+getchessdata <- getURL('https://raw.githubusercontent.com/mtelab1/Chess_ELO/master/tournamentinfo.webarchive.txt')
+tourny_results <- read.csv(text = getchessdata)
+
+
+```
+
+## Assign Regexp
+Given the current state of the text.  We will develope the regular expressions necessary to extract the relevant vectors of data.
+
+```{r}
+rxname <- "[[:digit:]]+[[:space:]]+[|]([:space:]+[:alpha:]+){2,}"
+rxstate <- "(?<=[:space:])[:alpha:]{2}(?=[:space:][|])"
+rxtotalpoints <-"[:digit:][:punct:][:digit:]"
+rxplayerstartingscore <- "(?<=R:[:space:]{1,2})[:digit:]+"
+rxplayersfinalscore <- "(?<=->[:space:]?)[:digit:]+"
+rxrnds <- "(?<=[:digit:][:punct:][:digit:][:space:]{1,2}[|]{1}).{40,}"
+
+
+
+```
+
+
+## Create Vectors
+Here we use the regular expressions to create the vectors.
+
+```{r}
+
+player_name <- unlist(str_extract_all(getchessdata,rxname))
+player_state <- unlist(str_extract_all(getchessdata,rxstate))
+total_points <- unlist(str_extract_all(getchessdata,rxtotalpoints))
+player_starting_score <- unlist(str_extract_all(getchessdata,rxplayerstartingscore))
+player_final_score <- unlist(str_extract_all(getchessdata,rxplayersfinalscore))
+rounds <- unlist(str_extract_all(getchessdata,rxrnds))
+```
+
+## Assemble
+Now we continue by combining the above vectors into a data frame for further processing.
+
+```{r}
+chess_cross_table <- data.frame(
+  player_name,
+  player_state,
+  player_starting_score,
+  player_final_score,
+  total_points,
+  rounds)
+```
+
+## Break Out Rounds
+The rounds were original collected above as one column, so now we need to parse those rounds out.
+
+```{r}
+col_names <- c("round_1","round_2","round_3","round_4","round_5","round_6","round_7")
+chess_cross_table <- chess_cross_table%>%
+  separate(rounds,col_names,sep = "[|]")
+```
+
+# Transform Data frame
+## Transpose Data
+The analysis is more efficient with elongated data, so we want to parse out the "round" columns to their own records.
+
+```{r}
+chess_cross_table_pivot <- chess_cross_table%>%
+  pivot_longer(col_names,names_to = "round",values_to = "result")
+
+```
+
+## Parse Result Column
+
+```{r}
+result_col_names <- c("result","opp_id")
+id_col_names <- c("id","player_name")
+chess_cross_table_pivot <- chess_cross_table_pivot%>%
+  separate(result,result_col_names)%>%
+  separate(player_name,id_col_names, sep = " [|]")
+
+```
+
+## Merge With Opp Rating
+Here we create a side table for the purpose of joining back to the original data with the opponent information.
+
+```{r}
+chessinfomergetable <- chess_cross_table_pivot%>%
+  select(id, player_state, player_starting_score,player_final_score)%>%
+  distinct()%>%
+  rename(opp_id=id, 
+         opp_player_state = player_state ,
+         opp_player_starting_score = player_starting_score,
+         opp_player_final_score = player_final_score)
+
+
+```
+
+
+```{r}
+chess_cross_table_comp<- merge(chess_cross_table_pivot,chessinfomergetable,all = TRUE)%>%
+  mutate(starting_rating_diff = as.numeric(player_starting_score) - as.numeric(opp_player_starting_score))
+str(chess_cross_table_comp)
+```
+
+# Calculate Metrics
+Now that we have the data in the format we want, we can summarize the opponent statistics.
+
+```{r}
+chess_cross_table_smry <- chess_cross_table_comp%>%
+  mutate(opp_player_starting_score = as.numeric(opp_player_starting_score), opp_player_final_score = as.numeric(opp_player_final_score), player_starting_score = as.numeric(player_starting_score), player_final_score = as.numeric(player_final_score), id = as.integer(id), total_points = as.numeric(total_points))%>%
+  #Filter out the records with no match played
+  filter(!is.na(opp_player_state))%>%
+  #Group by player
+  group_by(id,player_name, player_starting_score,player_final_score, total_points)%>%
+  #Add average opponent rating and number of matches
+  summarise(avg_opp_starting_score = round(mean(opp_player_starting_score),2), avg_opp_final_score = round(mean(opp_player_final_score),2), num_of_matches = length(round))
+```
+
+## Expected Vs Actual Point Outcome
+Using the definitions and formulas found in the link below, we move forward generating the ELO expected score, which is essentially the probability of winning a match.  With the expected score based on the average opponent rating, we can predict the expected point by multiplying by number of matches.
+[link](https://en.wikipedia.org/wiki/Elo_rating_system#Mathematical_details)
+
+```{r}
+
+chess_cross_table_smry <- chess_cross_table_smry%>%
+  mutate('expected_score' = round((1/(1+10^((avg_opp_starting_score-player_starting_score)/400))),2))%>%
+  mutate('expected_points' = round( expected_score * num_of_matches,2))
+
+```
+
+## Percent Deviation From Prediction
+
+```{r}
+chess_cross_table_smry <- chess_cross_table_smry%>%
+  mutate(percent_deviation = round((total_points - expected_points)/total_points,2))
+```
+# ELO Prediction Performance
+## Accuracy Distribution
+The below plot shows the distribution of the prediction accuracy, by looking at the total performance by participant.  By plotting the total score prediction/outcome difference, we see a cluster roughly around 0 which is expected; those are the outcomes that are very similar to the predictions.
+
+As we move closer the the right(towards 1+), we see the heros of the tournament.  These participants score way more points than expected.  To keep things positive, we wont dwell on the left side of the graph.
+
+```{r}
+ggplot(chess_cross_table_smry, aes(x= percent_deviation))+ geom_histogram(binwidth = .1)
+```
+
+## Underdog Performance
+Here we examine the results by only looking at the underdog matches individually.  In other words, from the perspective of the participant in a match with a lower starting rating.
+
+As we can see the proportion of upsets does indeed get larger as the ELO rating difference gets smaller.
+
+```{r}
+chess_wins <- chess_cross_table_comp %>% 
+  filter(starting_rating_diff <0)
+  
+ggplot(data = chess_wins, mapping = aes(x = starting_rating_diff, fill = result)) +
+  geom_histogram(binwidth = 50)
+```
+
+## Top Sleepers
+And finally, we give credit to the overachievers of the tournament.  The below participants did the best in terms of beating their ELO expectation.
+
+```{r }
+chess_cross_table_smry%>%
+  subset(select = c(player_name, total_points, expected_points, percent_deviation))%>%
+  arrange(desc(percent_deviation))%>%
+  head(10)
+```
+
+
+# Check-Mate Conclusion
+After calculating expected outcomes based on the ELO rating, it is clear that the rating system is delivering higher scores to the most effective chess players.  However as the expression goes, "there is a reason we play the game." This tournament was riddled with upsets.  If I were a chess coach, I would utilize the above analysis to motivate my chess player if he has a particularly low ELO.  
+
+*"Beware of barking at underdogs; don't fight with people who have nothing to lose."* -- Dory Previn
+
+```{r}
+write.csv(chess_cross_table_comp,"chess_cross-table.csv", row.names = FALSE)
+write.csv(chess_cross_table_smry,"chess_cross-table-summary.csv", row.names = FALSE)
+```
+
